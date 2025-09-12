@@ -258,8 +258,11 @@ auth_gate()
 
 with st.sidebar:
     st.header("Configuración")
-    default_key = st.secrets.get("DEFAULT_GOOGLE_API_KEY", "")
-    api_key = st.text_input("Google API Key", type="password", value=default_key, help="Places API habilitada.")
+    api_key = st.secrets.get("DEFAULT_GOOGLE_API_KEY", "")
+if not api_key:
+    st.error("Falta configurar DEFAULT_GOOGLE_API_KEY en Secrets (Manage app → Settings → Secrets).")
+    st.stop()
+
     business_query = st.text_input("¿Qué negocio buscas?", value="peluquerías", help="Ej.: dentistas, autoescuelas, fisioterapia, abogados, etc.")
     city = st.text_input("Ciudad", value="Cádiz")
     search_lang = st.selectbox("Idioma de resultados", ["es", "en"], index=0)
@@ -367,3 +370,4 @@ if run_btn:
     )
 
     st.caption("Nota: algunas webs no publican correo o lo ocultan; aun así rastreamos contacto/privacidad/legal/about y sitemap si existe.")
+
