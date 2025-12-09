@@ -1,7 +1,20 @@
-import time, re, io, json, requests, pandas as pd, streamlit as st, asyncio, aiohttp
+import time
+import re
+import io
+import json
+import asyncio
+import requests
+import pandas as pd
+import streamlit as st
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────
 # Seguridad: contraseña y rate-limit
@@ -413,12 +426,16 @@ async def crawl_multiple_sites_async(websites: list[str], max_pages: int = 8, de
                 task = crawl_site_for_emails_async(session, site, max_pages, delay)
                 tasks.append((idx, task))
 
-        # Ejecutar todas las tareas en paralelo
-        for idx, task in tasks:
-            try:
-                result = await task
+        # Ejecutar todas las tareas en paralelo con asyncio.gather
+        task_list = [task for idx, task in tasks]
+        completed_results = await asyncio.gather(*task_list, return_exceptions=True)
+
+        # Mapear resultados a los índices correctos
+        for i, (idx, _) in enumerate(tasks):
+            result = completed_results[i]
+            if isinstance(result, set):
                 results[idx] = result
-            except Exception:
+            else:
                 results[idx] = set()
 
     return results
@@ -480,7 +497,14 @@ with st.sidebar:
     st.divider()
     st.subheader("Emails (opcional)")
     do_emails = st.checkbox("Buscar emails en webs oficiales", value=True)
-    use_async = st.checkbox("Usar modo AsyncIO (10-30x más rápido)", value=True, help="Recomendado: usa asyncio para máxima velocidad.")
+
+    # Solo mostrar opción AsyncIO si está disponible
+    if AIOHTTP_AVAILABLE:
+        use_async = st.checkbox("Usar modo AsyncIO (10-30x más rápido)", value=True, help="Recomendado: usa asyncio para máxima velocidad.")
+    else:
+        use_async = False
+        st.info("💡 Para mejor rendimiento, instala aiohttp: `pip install aiohttp`")
+
     max_email_pages = st.slider("Páginas máximo por web", 1, 20, 8, help="Más páginas = más probabilidad (pero más lento).")
 
     if use_async:
@@ -549,7 +573,7 @@ if run_btn:
         df.drop_duplicates(subset=["name", "address"], inplace=True)
 
     st.success(f"Con detalles: **{len(df)}** negocios únicos.")
-    st.dataframe(df[["name","address","phone","website","source_city_query"]], use_container_width=True)
+    st.dataframe(df[["name","address","phone","website","source_city_query"]], width="stretch")
 
     # Emails (opcional) - PROCESAMIENTO PARALELO o ASYNCIO
     if do_emails and not df.empty:
@@ -562,9 +586,19 @@ if run_btn:
             st.info(f"⚡ Buscando emails (AsyncIO: {max_workers} conexiones concurrentes)…")
             prog2 = st.progress(0.0, text="Rastreando emails con AsyncIO…")
 
-            # Ejecutar asyncio
+            # Ejecutar asyncio de forma segura en Streamlit
             try:
-                email_results_sets = asyncio.run(
+                # Intentar obtener el loop existente o crear uno nuevo
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                email_results_sets = loop.run_until_complete(
                     crawl_multiple_sites_async(websites, max_email_pages, email_delay, max_workers)
                 )
                 email_results = [", ".join(sorted(emails)) if emails else "" for emails in email_results_sets]
@@ -613,7 +647,7 @@ if run_btn:
             df.drop(columns=[c], inplace=True)
 
     st.subheader("Resultados")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
     csv_buf = io.StringIO()
     df.to_csv(csv_buf, index=False, encoding="utf-8-sig")
