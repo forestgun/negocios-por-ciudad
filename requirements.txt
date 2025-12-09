@@ -2,3 +2,5 @@ streamlit
 requests
 pandas
 beautifulsoup4
+aiohttp
+lxml
