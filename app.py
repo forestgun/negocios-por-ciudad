@@ -56,6 +56,78 @@ TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 DETAILS_URL     = "https://maps.googleapis.com/maps/api/place/details/json"
 
 # ─────────────────────────────────────────────────────────────
+# CONSTANTES - Columnas esperadas del DataFrame
+# ─────────────────────────────────────────────────────────────
+EXPECTED_COLUMNS = ["name", "address", "phone", "website", "source_city_query"]
+ALL_COLUMNS = ["place_id", "name", "address", "phone", "website", "lat", "lng", "source_city_query"]
+
+# ─────────────────────────────────────────────────────────────
+# Utilidades de validación de DataFrame
+# ─────────────────────────────────────────────────────────────
+def safe_dataframe_display(df: pd.DataFrame, columns: list[str], fallback_message: str = "No hay datos para mostrar.") -> bool:
+    """
+    Muestra un DataFrame de forma segura, verificando que las columnas existan.
+    
+    Args:
+        df: DataFrame a mostrar
+        columns: Lista de columnas deseadas
+        fallback_message: Mensaje si no hay datos
+    
+    Returns:
+        True si se mostró el DataFrame, False si hubo problemas
+    """
+    if df is None or df.empty:
+        st.warning(fallback_message)
+        return False
+    
+    # Filtrar solo las columnas que existen
+    available_columns = [col for col in columns if col in df.columns]
+    
+    if not available_columns:
+        st.error(f"❌ Error: El DataFrame no tiene las columnas esperadas.")
+        st.write("**Columnas esperadas:**", columns)
+        st.write("**Columnas disponibles:**", df.columns.tolist())
+        return False
+    
+    # Mostrar advertencia si faltan columnas
+    missing_columns = [col for col in columns if col not in df.columns]
+    if missing_columns:
+        st.info(f"ℹ️ Algunas columnas no están disponibles: {missing_columns}")
+    
+    st.dataframe(df[available_columns], use_container_width=True)
+    return True
+
+def create_empty_dataframe_with_columns(columns: list[str]) -> pd.DataFrame:
+    """Crea un DataFrame vacío con las columnas especificadas."""
+    return pd.DataFrame(columns=columns)
+
+def validate_api_response(data: dict, operation: str) -> tuple[bool, str]:
+    """
+    Valida la respuesta de la API de Google Places.
+    
+    Returns:
+        (is_valid, error_message)
+    """
+    if not data:
+        return False, f"{operation}: Respuesta vacía de la API"
+    
+    status = data.get("status", "UNKNOWN")
+    
+    if status == "OK":
+        return True, ""
+    elif status == "ZERO_RESULTS":
+        return True, ""  # Válido pero sin resultados
+    elif status == "OVER_QUERY_LIMIT":
+        return False, f"{operation}: Has excedido el límite de consultas de la API. Espera unos minutos."
+    elif status == "REQUEST_DENIED":
+        return False, f"{operation}: Solicitud denegada. Verifica tu API Key y que Places API esté habilitada."
+    elif status == "INVALID_REQUEST":
+        return False, f"{operation}: Solicitud inválida. Verifica los parámetros."
+    else:
+        error_msg = data.get("error_message", "Error desconocido")
+        return False, f"{operation}: {status} - {error_msg}"
+
+# ─────────────────────────────────────────────────────────────
 # Utilidades web / emails
 # ─────────────────────────────────────────────────────────────
 def normalize_url(u: str | None) -> str | None:
@@ -280,202 +352,254 @@ def crawl_multiple_sites_parallel(websites: list[str], max_pages: int = 8, delay
 # ASYNCIO - Versión asíncrona (10-30x más rápida)
 # ─────────────────────────────────────────────────────────────
 
-async def find_emails_on_page_async(session: aiohttp.ClientSession, url: str, timeout: int = 5) -> tuple[set[str], list[str]]:
-    """Versión asíncrona de find_emails_on_page."""
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-            if response.status != 200:
-                return set(), []
+if AIOHTTP_AVAILABLE:
+    async def find_emails_on_page_async(session: aiohttp.ClientSession, url: str, timeout: int = 5) -> tuple[set[str], list[str]]:
+        """Versión asíncrona de find_emails_on_page."""
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                if response.status != 200:
+                    return set(), []
 
-            # Limitar tamaño de descarga a 1MB
-            content = await response.content.read(1_000_000)
+                # Limitar tamaño de descarga a 1MB
+                content = await response.content.read(1_000_000)
 
-            if not content:
-                return set(), []
+                if not content:
+                    return set(), []
 
-            soup = BeautifulSoup(content, "html.parser")
+                soup = BeautifulSoup(content, "html.parser")
 
-            text = soup.get_text(" ", strip=True)
-            found = set(EMAIL_REGEX.findall(text))
-            found |= extract_emails_jsonld(soup)
+                text = soup.get_text(" ", strip=True)
+                found = set(EMAIL_REGEX.findall(text))
+                found |= extract_emails_jsonld(soup)
 
-            # Buscar enlaces mailto
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                if href.lower().startswith("mailto:"):
-                    addr = href.split("mailto:", 1)[1].split("?", 1)[0]
-                    for part in addr.replace(";", ",").split(","):
-                        part = part.strip()
-                        if part:
-                            found.add(part)
+                # Buscar enlaces mailto
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].strip()
+                    if href.lower().startswith("mailto:"):
+                        addr = href.split("mailto:", 1)[1].split("?", 1)[0]
+                        for part in addr.replace(";", ",").split(","):
+                            part = part.strip()
+                            if part:
+                                found.add(part)
 
-            found |= extract_obfuscated(text)
-            found = {e for e in found if "@" in e and not e.lower().endswith("@google.com")}
+                found |= extract_obfuscated(text)
+                found = {e for e in found if "@" in e and not e.lower().endswith("@google.com")}
 
-            # Extraer enlaces
-            links = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                if href.startswith("#") or href.lower().startswith("tel:"):
-                    continue
-                links.append(urljoin(url, href))
+                # Extraer enlaces
+                links = []
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].strip()
+                    if href.startswith("#") or href.lower().startswith("tel:"):
+                        continue
+                    links.append(urljoin(url, href))
 
-            return found, links
-    except Exception:
-        return set(), []
+                return found, links
+        except Exception:
+            return set(), []
 
-async def parse_sitemap_for_contacts_async(session: aiohttp.ClientSession, sitemap_url: str, timeout: int = 5) -> list[str]:
-    """Versión asíncrona de parse_sitemap_for_contacts."""
-    try:
-        async with session.get(sitemap_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-            if response.status != 200:
-                return []
-            content = await response.read()
-            if not content:
-                return []
+    async def parse_sitemap_for_contacts_async(session: aiohttp.ClientSession, sitemap_url: str, timeout: int = 5) -> list[str]:
+        """Versión asíncrona de parse_sitemap_for_contacts."""
+        try:
+            async with session.get(sitemap_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                if response.status != 200:
+                    return []
+                content = await response.read()
+                if not content:
+                    return []
 
-            soup = BeautifulSoup(content, "xml")
-            urls = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
-            keys = ("contact", "contacto", "aviso", "legal", "privacy", "privacidad", "about", "quien", "quién", "mail")
-            return [u for u in urls if any(k in u.lower() for k in keys)]
-    except Exception:
-        return []
+                soup = BeautifulSoup(content, "xml")
+                urls = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
+                keys = ("contact", "contacto", "aviso", "legal", "privacy", "privacidad", "about", "quien", "quién", "mail")
+                return [u for u in urls if any(k in u.lower() for k in keys)]
+        except Exception:
+            return []
 
-async def crawl_site_for_emails_async(session: aiohttp.ClientSession, start_url: str, max_pages: int = 8, delay: float = 0.1) -> set[str]:
-    """Versión asíncrona de crawl_site_for_emails - mucho más rápida."""
-    start = normalize_url(start_url)
-    if not start:
-        return set()
+    async def crawl_site_for_emails_async(session: aiohttp.ClientSession, start_url: str, max_pages: int = 8, delay: float = 0.1) -> set[str]:
+        """Versión asíncrona de crawl_site_for_emails - mucho más rápida."""
+        start = normalize_url(start_url)
+        if not start:
+            return set()
 
-    seen: set[str] = set()
-    queue: list[str] = seed_candidate_urls(start)
-    found: set[str] = set()
-    base = start
+        seen: set[str] = set()
+        queue: list[str] = seed_candidate_urls(start)
+        found: set[str] = set()
+        base = start
 
-    sm = normalize_url(urljoin(start, "/sitemap.xml"))
-    if sm and sm not in queue:
-        queue.append(sm)
+        sm = normalize_url(urljoin(start, "/sitemap.xml"))
+        if sm and sm not in queue:
+            queue.append(sm)
 
-    while queue and len(seen) < max_pages:
-        url = queue.pop(0)
-        if url in seen:
-            continue
+        while queue and len(seen) < max_pages:
+            url = queue.pop(0)
+            if url in seen:
+                continue
 
-        if url.endswith("/sitemap.xml"):
-            sitemap_urls = await parse_sitemap_for_contacts_async(session, url, timeout=5)
-            for u in sitemap_urls:
-                if u not in seen:
-                    queue.append(u)
+            if url.endswith("/sitemap.xml"):
+                sitemap_urls = await parse_sitemap_for_contacts_async(session, url, timeout=5)
+                for u in sitemap_urls:
+                    if u not in seen:
+                        queue.append(u)
+                seen.add(url)
+                continue
+
+            if not same_domain(base, url):
+                continue
+
             seen.add(url)
-            continue
+            emails, links = await find_emails_on_page_async(session, url, timeout=5)
+            found.update(emails)
 
-        if not same_domain(base, url):
-            continue
+            prioritized = [l for l in links if any(x in l.lower() for x in
+                ["contact", "contacto", "aviso", "legal", "privacy", "privacidad", "about", "quien", "quién", "info", "mail"])]
+            if len(prioritized) < 2:
+                for l in links:
+                    if l not in prioritized and same_domain(base, l):
+                        prioritized.append(l)
+                    if len(prioritized) >= 6:
+                        break
 
-        seen.add(url)
-        emails, links = await find_emails_on_page_async(session, url, timeout=5)
-        found.update(emails)
+            for l in prioritized:
+                if l not in seen and len(seen) + len(queue) < max_pages + 10:
+                    queue.append(l)
 
-        prioritized = [l for l in links if any(x in l.lower() for x in
-            ["contact", "contacto", "aviso", "legal", "privacy", "privacidad", "about", "quien", "quién", "info", "mail"])]
-        if len(prioritized) < 2:
-            for l in links:
-                if l not in prioritized and same_domain(base, l):
-                    prioritized.append(l)
-                if len(prioritized) >= 6:
-                    break
+            # Delay muy pequeño (asyncio maneja la concurrencia mejor)
+            if delay > 0:
+                await asyncio.sleep(delay)
 
-        for l in prioritized:
-            if l not in seen and len(seen) + len(queue) < max_pages + 10:
-                queue.append(l)
+        return found
 
-        # Delay muy pequeño (asyncio maneja la concurrencia mejor)
-        if delay > 0:
-            await asyncio.sleep(delay)
+    async def crawl_multiple_sites_async(websites: list[str], max_pages: int = 8, delay: float = 0.1, max_concurrent: int = 20) -> list[set[str]]:
+        """
+        Procesa múltiples sitios web de forma asíncrona (MUCHO MÁS RÁPIDO).
 
-    return found
+        Args:
+            websites: Lista de URLs de sitios web a rastrear
+            max_pages: Número máximo de páginas por sitio
+            delay: Delay entre páginas del mismo sitio (puede ser muy bajo con asyncio)
+            max_concurrent: Número máximo de sitios procesándose simultáneamente
 
-async def crawl_multiple_sites_async(websites: list[str], max_pages: int = 8, delay: float = 0.1, max_concurrent: int = 20) -> list[set[str]]:
+        Returns:
+            Lista de sets de emails, en el mismo orden que websites
+        """
+        results = [set() for _ in websites]
+
+        # Configurar session con headers
+        connector = aiohttp.TCPConnector(limit=max_concurrent, limit_per_host=5)
+        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=10)
+
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36"}
+        ) as session:
+            # Crear tareas para todos los sitios
+            tasks = []
+            for idx, site in enumerate(websites):
+                if site:
+                    task = crawl_site_for_emails_async(session, site, max_pages, delay)
+                    tasks.append((idx, task))
+
+            # Ejecutar todas las tareas en paralelo con asyncio.gather
+            task_list = [task for idx, task in tasks]
+            completed_results = await asyncio.gather(*task_list, return_exceptions=True)
+
+            # Mapear resultados a los índices correctos
+            for i, (idx, _) in enumerate(tasks):
+                result = completed_results[i]
+                if isinstance(result, set):
+                    results[idx] = result
+                else:
+                    results[idx] = set()
+
+        return results
+
+# ─────────────────────────────────────────────────────────────
+# Google Places - CON VALIDACIÓN MEJORADA
+# ─────────────────────────────────────────────────────────────
+def places_text_search_all(query: str, api_key: str, lang: str = "es", sleep_between_pages: float = 2.0) -> tuple[list[dict], str | None]:
     """
-    Procesa múltiples sitios web de forma asíncrona (MUCHO MÁS RÁPIDO).
-
-    Args:
-        websites: Lista de URLs de sitios web a rastrear
-        max_pages: Número máximo de páginas por sitio
-        delay: Delay entre páginas del mismo sitio (puede ser muy bajo con asyncio)
-        max_concurrent: Número máximo de sitios procesándose simultáneamente
-
+    Busca lugares usando Google Places Text Search API.
+    
     Returns:
-        Lista de sets de emails, en el mismo orden que websites
+        (results, error_message) - results es la lista de lugares, error_message es None si OK
     """
-    results = [set() for _ in websites]
-
-    # Configurar session con headers
-    connector = aiohttp.TCPConnector(limit=max_concurrent, limit_per_host=5)
-    timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=10)
-
-    async with aiohttp.ClientSession(
-        connector=connector,
-        timeout=timeout,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36"}
-    ) as session:
-        # Crear tareas para todos los sitios
-        tasks = []
-        for idx, site in enumerate(websites):
-            if site:
-                task = crawl_site_for_emails_async(session, site, max_pages, delay)
-                tasks.append((idx, task))
-
-        # Ejecutar todas las tareas en paralelo con asyncio.gather
-        task_list = [task for idx, task in tasks]
-        completed_results = await asyncio.gather(*task_list, return_exceptions=True)
-
-        # Mapear resultados a los índices correctos
-        for i, (idx, _) in enumerate(tasks):
-            result = completed_results[i]
-            if isinstance(result, set):
-                results[idx] = result
-            else:
-                results[idx] = set()
-
-    return results
-
-# ─────────────────────────────────────────────────────────────
-# Google Places
-# ─────────────────────────────────────────────────────────────
-def places_text_search_all(query: str, api_key: str, lang: str = "es", sleep_between_pages: float = 2.0) -> list[dict]:
-    params = {"query": query, "key": api_key, "language": lang}
-    r = requests.get(TEXT_SEARCH_URL, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") not in ("OK", "ZERO_RESULTS"):
-        raise RuntimeError(f"TextSearch fallo: {data.get('status')} - {data.get('error_message')}")
-    results = list(data.get("results", []))
-
-    while True:
-        token = data.get("next_page_token")
-        if not token:
-            break
-        time.sleep(sleep_between_pages)
-        r = requests.get(TEXT_SEARCH_URL, params={"pagetoken": token, "key": api_key}, timeout=20)
+    try:
+        params = {"query": query, "key": api_key, "language": lang}
+        r = requests.get(TEXT_SEARCH_URL, params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
-        if data.get("status") not in ("OK", "ZERO_RESULTS"):
-            break
-        results.extend(data.get("results", []))
-    return results
+        
+        # Validar respuesta
+        is_valid, error_msg = validate_api_response(data, "TextSearch")
+        if not is_valid:
+            return [], error_msg
+        
+        results = list(data.get("results", []))
 
-def place_details(place_id: str, api_key: str, lang: str = "es") -> dict:
-    params = {
-        "place_id": place_id, "key": api_key, "language": lang,
-        "fields": "name,formatted_address,international_phone_number,website,geometry/location"
-    }
-    r = requests.get(DETAILS_URL, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") not in ("OK", "ZERO_RESULTS", "NOT_FOUND"):
-        raise RuntimeError(f"Details fallo: {data.get('status')} - {data.get('error_message')}")
-    return data.get("result", {}) or {}
+        # Paginación
+        page_count = 1
+        max_pages = 3  # Límite de seguridad
+        
+        while page_count < max_pages:
+            token = data.get("next_page_token")
+            if not token:
+                break
+            time.sleep(sleep_between_pages)
+            
+            try:
+                r = requests.get(TEXT_SEARCH_URL, params={"pagetoken": token, "key": api_key}, timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                
+                is_valid, _ = validate_api_response(data, "TextSearch (página)")
+                if not is_valid:
+                    break
+                    
+                results.extend(data.get("results", []))
+                page_count += 1
+            except requests.RequestException:
+                break
+        
+        return results, None
+        
+    except requests.Timeout:
+        return [], "TextSearch: Tiempo de espera agotado. Intenta de nuevo."
+    except requests.RequestException as e:
+        return [], f"TextSearch: Error de conexión - {str(e)}"
+    except Exception as e:
+        return [], f"TextSearch: Error inesperado - {str(e)}"
+
+def place_details(place_id: str, api_key: str, lang: str = "es") -> tuple[dict, str | None]:
+    """
+    Obtiene detalles de un lugar específico.
+    
+    Returns:
+        (result, error_message) - result es el diccionario de detalles, error_message es None si OK
+    """
+    try:
+        params = {
+            "place_id": place_id, "key": api_key, "language": lang,
+            "fields": "name,formatted_address,international_phone_number,website,geometry/location"
+        }
+        r = requests.get(DETAILS_URL, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        
+        status = data.get("status", "UNKNOWN")
+        if status == "OK":
+            return data.get("result", {}), None
+        elif status in ("ZERO_RESULTS", "NOT_FOUND"):
+            return {}, None  # No es error, simplemente no existe
+        else:
+            error_msg = data.get("error_message", "")
+            return {}, f"Details ({status}): {error_msg}"
+            
+    except requests.Timeout:
+        return {}, "Details: Tiempo de espera agotado"
+    except requests.RequestException as e:
+        return {}, f"Details: Error de conexión - {str(e)}"
+    except Exception as e:
+        return {}, f"Details: Error inesperado - {str(e)}"
 
 # ─────────────────────────────────────────────────────────────
 # UI
@@ -522,26 +646,42 @@ with st.sidebar:
     run_btn = st.button("🔍 Buscar")
 
 if run_btn:
+    # ─────────────────────────────────────────────────────────────
+    # VALIDACIÓN DE ENTRADA
+    # ─────────────────────────────────────────────────────────────
     if not api_key:
-        st.error("Falta Google API Key.")
+        st.error("❌ Falta Google API Key.")
         st.stop()
     if not business_query.strip() or not city.strip():
-        st.error("Escribe el tipo de negocio y la ciudad.")
+        st.error("❌ Escribe el tipo de negocio y la ciudad.")
         st.stop()
 
     # Rate-limit
     rate_limit(max_per_min=4)
 
     q = f"{business_query.strip()} en {city.strip()}"
-    st.info(f"Buscando: **{q}**")
-    try:
-        raw = places_text_search_all(q, api_key=api_key, lang=search_lang, sleep_between_pages=page_sleep)
-    except Exception as e:
-        st.error(f"Error en Text Search: {e}")
+    st.info(f"🔍 Buscando: **{q}**")
+    
+    # ─────────────────────────────────────────────────────────────
+    # BÚSQUEDA DE LUGARES - CON MANEJO DE ERRORES
+    # ─────────────────────────────────────────────────────────────
+    raw, search_error = places_text_search_all(q, api_key=api_key, lang=search_lang, sleep_between_pages=page_sleep)
+    
+    if search_error:
+        st.error(f"❌ {search_error}")
+        st.stop()
+    
+    if not raw:
+        st.warning(f"⚠️ No se encontraron resultados para '{q}'. Prueba con otra búsqueda o ciudad.")
         st.stop()
 
-    st.write(f"Resultados preliminares: **{len(raw)}**")
+    st.write(f"📍 Resultados preliminares: **{len(raw)}**")
+    
+    # ─────────────────────────────────────────────────────────────
+    # OBTENER DETALLES - CON VALIDACIÓN
+    # ─────────────────────────────────────────────────────────────
     rows, seen = [], set()
+    errors_count = 0
     progress = st.progress(0.0, text="Pidiendo detalles…")
     total = max(len(raw), 1)
 
@@ -551,15 +691,22 @@ if run_btn:
             progress.progress(i/total, text=f"Saltando duplicados… {i}/{total}")
             continue
         seen.add(pid)
-        try:
-            det = place_details(pid, api_key=api_key, lang=search_lang)
-        except Exception:
-            det = {}
+        
+        det, detail_error = place_details(pid, api_key=api_key, lang=search_lang)
+        
+        if detail_error:
+            errors_count += 1
+            # Si hay muchos errores seguidos, probablemente hay un problema con la API
+            if errors_count > 5:
+                st.warning(f"⚠️ Demasiados errores al obtener detalles. Último error: {detail_error}")
+                break
+        
+        # Crear fila con valores por defecto para evitar KeyError
         rows.append({
             "place_id": pid,
-            "name": det.get("name"),
-            "address": det.get("formatted_address"),
-            "phone": det.get("international_phone_number"),
+            "name": det.get("name") or it.get("name", "Sin nombre"),
+            "address": det.get("formatted_address") or it.get("formatted_address", ""),
+            "phone": det.get("international_phone_number", ""),
             "website": normalize_url(det.get("website")),
             "lat": (det.get("geometry", {}) or {}).get("location", {}).get("lat"),
             "lng": (det.get("geometry", {}) or {}).get("location", {}).get("lng"),
@@ -568,20 +715,46 @@ if run_btn:
         progress.progress(i/total, text=f"Detalles {i}/{total}")
         time.sleep(details_delay)
 
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df.drop_duplicates(subset=["name", "address"], inplace=True)
+    # ─────────────────────────────────────────────────────────────
+    # CREAR DATAFRAME - CON VALIDACIÓN
+    # ─────────────────────────────────────────────────────────────
+    if not rows:
+        st.warning("⚠️ No se pudieron obtener detalles de ningún negocio.")
+        # Crear DataFrame vacío con columnas correctas para evitar errores posteriores
+        df = create_empty_dataframe_with_columns(ALL_COLUMNS)
+    else:
+        df = pd.DataFrame(rows)
+        
+        # Asegurar que todas las columnas esperadas existan
+        for col in ALL_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        
+        # Eliminar duplicados solo si hay datos
+        if not df.empty and "name" in df.columns and "address" in df.columns:
+            df.drop_duplicates(subset=["name", "address"], inplace=True)
 
-    st.success(f"Con detalles: **{len(df)}** negocios únicos.")
-    st.dataframe(df[["name","address","phone","website","source_city_query"]], width="stretch")
+    # ─────────────────────────────────────────────────────────────
+    # MOSTRAR RESULTADOS PARCIALES - CON VALIDACIÓN
+    # ─────────────────────────────────────────────────────────────
+    if df.empty:
+        st.warning("⚠️ No hay negocios para mostrar.")
+    else:
+        st.success(f"✅ Con detalles: **{len(df)}** negocios únicos.")
+        safe_dataframe_display(df, EXPECTED_COLUMNS, "No hay datos para mostrar.")
 
-    # Emails (opcional) - PROCESAMIENTO PARALELO o ASYNCIO
-    if do_emails and not df.empty:
-        # Obtener lista de websites
-        websites = df["website"].tolist()
+    # ─────────────────────────────────────────────────────────────
+    # EMAILS (OPCIONAL) - CON VALIDACIÓN
+    # ─────────────────────────────────────────────────────────────
+    if do_emails and not df.empty and "website" in df.columns:
+        # Obtener lista de websites de forma segura
+        websites = df["website"].fillna("").tolist()
         total_sites = len([s for s in websites if s])
-
-        if use_async:
+        
+        if total_sites == 0:
+            st.info("ℹ️ Ningún negocio tiene website para buscar emails.")
+            df["emails"] = ""
+        elif use_async and AIOHTTP_AVAILABLE:
             # ⚡ MODO ASYNCIO - SUPER RÁPIDO
             st.info(f"⚡ Buscando emails (AsyncIO: {max_workers} conexiones concurrentes)…")
             prog2 = st.progress(0.0, text="Rastreando emails con AsyncIO…")
@@ -604,8 +777,10 @@ if run_btn:
                 email_results = [", ".join(sorted(emails)) if emails else "" for emails in email_results_sets]
                 prog2.progress(1.0, text=f"✅ Completado: {total_sites} sitios")
             except Exception as e:
-                st.error(f"Error en AsyncIO: {e}")
+                st.error(f"❌ Error en AsyncIO: {e}")
                 email_results = [""] * len(websites)
+
+            df["emails"] = email_results
 
         else:
             # 🔄 MODO THREADING - Compatible pero más lento
@@ -636,26 +811,49 @@ if run_btn:
                     completed += 1
                     prog2.progress(completed / max(total_sites, 1), text=f"Emails {completed}/{total_sites} sitios completados")
 
-        df["emails"] = email_results
-        st.success(f"✅ Rastreo completado: {sum(1 for e in email_results if e)} sitios con emails encontrados")
+            df["emails"] = email_results
+        
+        emails_found = sum(1 for e in df["emails"] if e)
+        st.success(f"✅ Rastreo completado: {emails_found} sitios con emails encontrados")
     else:
-        df["emails"] = ""
+        if "emails" not in df.columns:
+            df["emails"] = ""
 
+    # ─────────────────────────────────────────────────────────────
+    # PREPARAR RESULTADOS FINALES - CON VALIDACIÓN
+    # ─────────────────────────────────────────────────────────────
     # Quitar columnas técnicas antes de mostrar/descargar
-    for c in ("place_id", "lat", "lng"):
+    columns_to_drop = ["place_id", "lat", "lng"]
+    for c in columns_to_drop:
         if c in df.columns:
             df.drop(columns=[c], inplace=True)
 
-    st.subheader("Resultados")
-    st.dataframe(df, width="stretch")
+    st.subheader("📊 Resultados Finales")
+    
+    if df.empty:
+        st.warning("⚠️ No hay resultados para mostrar.")
+    else:
+        st.dataframe(df, use_container_width=True)
 
-    csv_buf = io.StringIO()
-    df.to_csv(csv_buf, index=False, encoding="utf-8-sig")
-    st.download_button(
-        "⬇️ Descargar CSV",
-        data=csv_buf.getvalue().encode("utf-8-sig"),
-        file_name=f"{business_query.strip()}_{city.strip()}.csv",
-        mime="text/csv"
-    )
+        # ─────────────────────────────────────────────────────────────
+        # DESCARGA CSV - CON VALIDACIÓN
+        # ─────────────────────────────────────────────────────────────
+        try:
+            csv_buf = io.StringIO()
+            df.to_csv(csv_buf, index=False, encoding="utf-8-sig")
+            
+            # Sanitizar nombre de archivo
+            safe_business = re.sub(r'[^\w\s-]', '', business_query.strip())[:30]
+            safe_city = re.sub(r'[^\w\s-]', '', city.strip())[:30]
+            filename = f"{safe_business}_{safe_city}.csv"
+            
+            st.download_button(
+                "⬇️ Descargar CSV",
+                data=csv_buf.getvalue().encode("utf-8-sig"),
+                file_name=filename,
+                mime="text/csv"
+            )
+        except Exception as e:
+            st.error(f"❌ Error al generar CSV: {e}")
 
-    st.caption("Nota: algunas webs no publican correo o lo ocultan; aun así rastreamos contacto/privacidad/legal/about y sitemap si existe.")
+    st.caption("📝 Nota: algunas webs no publican correo o lo ocultan; aun así rastreamos contacto/privacidad/legal/about y sitemap si existe.")
