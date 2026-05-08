@@ -44,10 +44,20 @@ DETAILS_URL     = "https://maps.googleapis.com/maps/api/place/details/json"
 # ─────────────────────────────────────────────────────────────
 # Utilidades web / emails
 # ─────────────────────────────────────────────────────────────
-def normalize_url(u: str | None) -> str | None:
-    if not u: return None
+def normalize_url(u) -> str | None:
+    if u is None:
+        return None
+    if not isinstance(u, str):
+        try:
+            if pd.isna(u):
+                return None
+        except Exception:
+            pass
+        return None
+
     u = u.strip()
-    if not u or u.startswith(("mailto:", "tel:")): return None
+    if not u or u.startswith(("mailto:", "tel:")):
+        return None
     if not u.startswith(("http://", "https://")):
         u = "http://" + u
     return u.rstrip("/")
